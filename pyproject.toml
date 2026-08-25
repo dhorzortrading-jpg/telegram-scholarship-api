@@ -1,0 +1,9 @@
+[project]
+name = "telegram-scholarship-api"
+version = "0.1.0"
+description = "FastAPI service for scholarship opportunities collected from monitored Telegram sources."
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi>=0.141.1",
+    "uvicorn>=0.52.4",
+]
