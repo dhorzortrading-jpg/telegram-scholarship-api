@@ -392,6 +392,7 @@ def api_info() -> dict[str, Any]:
             "POST /trades/telegram",
             "POST /trades/media",
             "GET /trades/media/{filename}",
+            "GET /trades/{item_id}/image",
             "GET /trades/recent",
             "GET /trades/{item_id}",
         ],
@@ -823,6 +824,84 @@ def get_trade_media(filename: str) -> FileResponse:
     return FileResponse(
         media_path,
         media_type=media_type or "application/octet-stream",
+        filename=media_path.name,
+    )
+
+
+def media_filename_from_trade(row: sqlite3.Row) -> str | None:
+    if row["media_file"]:
+        return str(row["media_file"])
+
+    media_url = row["media_url"]
+    if media_url:
+        url_path = media_url.split("?", 1)[0].rstrip("/")
+        return url_path.rsplit("/", 1)[-1] or None
+
+    return None
+
+
+def is_image_media_type(media_type: str | None) -> bool:
+    normalized = (media_type or "").lower().strip()
+    return normalized == "photo" or normalized == "image" or normalized.startswith(
+        "image/"
+    )
+
+
+@app.get("/trades/{item_id}/image")
+def get_trade_image(item_id: int) -> FileResponse:
+    with get_connection() as connection:
+        row = connection.execute(
+            """
+            SELECT *
+            FROM trades
+            WHERE id = ?
+            """,
+            (item_id,),
+        ).fetchone()
+
+    if row is None:
+        raise HTTPException(status_code=404, detail="Trade record not found")
+
+    if not row["has_media"]:
+        raise HTTPException(status_code=404, detail="Trade has no media")
+
+    if not is_image_media_type(row["media_type"]):
+        raise HTTPException(status_code=400, detail="Trade media is not an image")
+
+    filename = media_filename_from_trade(row)
+    if filename is None:
+        raise HTTPException(status_code=404, detail="Trade image file not found")
+
+    try:
+        media_path = resolve_media_path(filename)
+    except HTTPException:
+        media_path = None
+
+    if media_path is None:
+        if row["media_url"]:
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "detail": "Trade image file not found",
+                    "media_url": row["media_url"],
+                },
+            )
+        raise HTTPException(status_code=404, detail="Trade image file not found")
+
+    media_type = mimetypes.guess_type(media_path.name)[0]
+    if media_type not in ALLOWED_MEDIA_TYPES:
+        media_type = {
+            "image/jpeg": "image/jpeg",
+            "image/png": "image/png",
+            "image/webp": "image/webp",
+        }.get((row["media_type"] or "").lower())
+
+    if media_type not in ALLOWED_MEDIA_TYPES:
+        raise HTTPException(status_code=400, detail="Trade media is not an image")
+
+    return FileResponse(
+        media_path,
+        media_type=media_type,
         filename=media_path.name,
     )
 
