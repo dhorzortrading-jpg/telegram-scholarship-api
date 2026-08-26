@@ -398,6 +398,104 @@ def today_scholarships() -> list[Scholarship]:
 # SCHOLARSHIP BY ID
 # ============================================================
 
+from typing import Optional
+from pydantic import BaseModel
+
+
+class TelegramScholarshipIn(BaseModel):
+    source_group: str
+    source_username: Optional[str] = None
+    telegram_chat_id: Optional[int] = None
+    telegram_message_id: int
+    telegram_date: Optional[str] = None
+    captured_at: str
+    original_text: str
+    telegram_message_link: Optional[str] = None
+    has_media: bool = False
+    media_type: Optional[str] = None
+
+
+@app.post("/scholarships/telegram")
+def receive_telegram_scholarship(item: TelegramScholarshipIn):
+    text = item.original_text.strip()
+
+    if not text:
+        raise HTTPException(
+            status_code=400,
+            detail="Telegram message contains no text",
+        )
+
+    first_line = next(
+        (line.strip() for line in text.splitlines() if line.strip()),
+        "Telegram Scholarship",
+    )
+
+    title = first_line[:250]
+    posted_at = item.telegram_date or item.captured_at
+
+    with get_connection() as connection:
+        existing = connection.execute(
+            """
+            SELECT id
+            FROM scholarships
+            WHERE source_channel = ?
+              AND source_message_id = ?
+            LIMIT 1
+            """,
+            (
+                item.source_group,
+                str(item.telegram_message_id),
+            ),
+        ).fetchone()
+
+        if existing is not None:
+            return {
+                "status": "duplicate",
+                "id": existing["id"],
+                "telegram_message_id": item.telegram_message_id,
+            }
+
+        cursor = connection.execute(
+            """
+            INSERT INTO scholarships (
+                title,
+                provider,
+                description,
+                amount,
+                deadline,
+                eligibility,
+                source_channel,
+                source_message_id,
+                source_url,
+                posted_at,
+                is_reviewed
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                title,
+                item.source_group,
+                text,
+                None,
+                None,
+                None,
+                item.source_group,
+                str(item.telegram_message_id),
+                item.telegram_message_link,
+                posted_at,
+                0,
+            ),
+        )
+
+        connection.commit()
+        scholarship_id = cursor.lastrowid
+
+    return {
+        "status": "saved",
+        "id": scholarship_id,
+        "telegram_message_id": item.telegram_message_id,
+        "source": item.source_group,
+    }
 @app.get(
     "/scholarships/{item_id}",
     response_model=Scholarship,
