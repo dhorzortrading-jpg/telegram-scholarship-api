@@ -1,0 +1,126 @@
+Extend the existing FastAPI website API with public storage and retrieval for Telegram trade images.
+
+Do not break any existing scholarship or trade endpoints.
+
+OBJECTIVE
+
+A Telegram bridge will upload a downloaded trade chart image to this API.
+
+The API must save the image and return a publicly accessible URL that can later be stored in the trade record and accessed by my Trade GPT.
+
+IMPLEMENTATION
+
+1. Create a directory beside main.py named:
+
+trade_media
+
+Create it automatically if it does not exist.
+
+2. Add this endpoint:
+
+POST /trades/media
+
+It must accept multipart/form-data containing:
+
+file: UploadFile
+telegram_chat_id: string
+telegram_message_id: string
+
+3. Accept image formats only:
+
+image/jpeg
+image/png
+image/webp
+
+Reject unsupported formats with HTTP 400.
+
+4. Generate a safe unique filename using:
+
+telegram_chat_id
+telegram_message_id
+original extension
+
+Example:
+
+trade_-100123456_87342.jpg
+
+Sanitize unsafe filename characters.
+
+5. Save the uploaded image inside:
+
+trade_media/
+
+6. Add:
+
+GET /trades/media/{filename}
+
+This endpoint must return the actual image file with the correct media type.
+
+Use FastAPI FileResponse or equivalent.
+
+Prevent path traversal.
+
+7. POST /trades/media must return JSON:
+
+{
+  "status": "saved",
+  "filename": "...",
+  "media_url": "https://telegram-scholarship-api.onrender.com/trades/media/..."
+}
+
+Do not hard-code localhost.
+
+Generate the public media URL from the incoming request base URL.
+
+8. Update TelegramTradeIn.
+
+Keep:
+
+media_file
+
+and add:
+
+media_url: str | None = None
+
+9. Update the trades SQLite table so it supports:
+
+media_url TEXT
+
+IMPORTANT:
+The trades table may already exist.
+
+Therefore implement a safe migration:
+
+PRAGMA table_info(trades)
+
+If media_url does not exist, run:
+
+ALTER TABLE trades ADD COLUMN media_url TEXT
+
+Do not delete or recreate the existing table.
+
+10. Update POST /trades/telegram so media_url is stored.
+
+11. Update:
+GET /trades/recent
+GET /trades/{item_id}
+
+so media_url is included in responses.
+
+12. Add the new routes to /api information:
+
+POST /trades/media
+GET /trades/media/{filename}
+
+13. Ensure python-multipart is installed because UploadFile multipart parsing requires it.
+
+14. Validate:
+- Python syntax
+- imports
+- database migration
+- image upload endpoint
+- public image endpoint
+- existing scholarship routes
+- existing trade routes
+
+Do not remove any existing working functionality.

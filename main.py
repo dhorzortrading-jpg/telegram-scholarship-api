@@ -1,11 +1,16 @@
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
+import mimetypes
 from pathlib import Path
+import re
 import sqlite3
 from typing import Any
+from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException, Query, status
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile, status
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict
+from urllib.parse import quote
 
 
 # ============================================================
@@ -13,6 +18,18 @@ from pydantic import BaseModel, ConfigDict
 # ============================================================
 
 DATABASE_PATH = Path(__file__).with_name("scholarships.db")
+MEDIA_DIRECTORY = Path(__file__).with_name("trade_media")
+
+ALLOWED_MEDIA_TYPES = {
+    "image/jpeg": {".jpg", ".jpeg"},
+    "image/png": {".png"},
+    "image/webp": {".webp"},
+}
+MEDIA_TYPE_EXTENSIONS = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+}
 
 
 def get_connection() -> sqlite3.Connection:
@@ -91,6 +108,7 @@ class Trade(BaseModel):
     has_media: bool
     media_type: str | None = None
     media_file: str | None = None
+    media_url: str | None = None
     status: str
     created_at: str | None = None
 
@@ -107,6 +125,7 @@ class TelegramTradeIn(BaseModel):
     has_media: bool = False
     media_type: str | None = None
     media_file: str | None = None
+    media_url: str | None = None
 
 
 # ============================================================
@@ -114,6 +133,8 @@ class TelegramTradeIn(BaseModel):
 # ============================================================
 
 def initialize_database() -> None:
+    MEDIA_DIRECTORY.mkdir(parents=True, exist_ok=True)
+
     with get_connection() as connection:
 
         # ----------------------------------------------------
@@ -158,12 +179,20 @@ def initialize_database() -> None:
                 has_media INTEGER NOT NULL DEFAULT 0,
                 media_type TEXT,
                 media_file TEXT,
+                media_url TEXT,
                 status TEXT NOT NULL DEFAULT 'NEW',
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(source_group, telegram_message_id)
             )
             """
         )
+
+        trade_columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(trades)").fetchall()
+        }
+        if "media_url" not in trade_columns:
+            connection.execute("ALTER TABLE trades ADD COLUMN media_url TEXT")
 
         # ----------------------------------------------------
         # EXISTING SAMPLE SCHOLARSHIP DATA
@@ -256,6 +285,32 @@ def row_to_trade(row: sqlite3.Row) -> Trade:
     return Trade(**values)
 
 
+def sanitize_media_identifier(value: str) -> str:
+    sanitized = re.sub(r"[^A-Za-z0-9_-]", "_", value).strip("_")
+    return sanitized[:100] or "unknown"
+
+
+def resolve_media_path(filename: str) -> Path:
+    media_root = MEDIA_DIRECTORY.resolve()
+    candidate = (media_root / filename).resolve()
+
+    if Path(filename).name != filename:
+        raise HTTPException(status_code=404, detail="Media file not found")
+
+    try:
+        candidate.relative_to(media_root)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail="Media file not found",
+        ) from exc
+
+    if not candidate.is_file():
+        raise HTTPException(status_code=404, detail="Media file not found")
+
+    return candidate
+
+
 def fetch_scholarships(
     where: str = "",
     parameters: tuple[Any, ...] = (),
@@ -335,6 +390,8 @@ def api_info() -> dict[str, Any]:
             "GET /scholarships/today",
             "GET /scholarships/{item_id}",
             "POST /trades/telegram",
+            "POST /trades/media",
+            "GET /trades/media/{filename}",
             "GET /trades/recent",
             "GET /trades/{item_id}",
         ],
@@ -669,9 +726,10 @@ def receive_telegram_trade(
                 has_media,
                 media_type,
                 media_file,
+                media_url,
                 status
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 item.source_group,
@@ -689,6 +747,7 @@ def receive_telegram_trade(
                 int(item.has_media),
                 item.media_type,
                 item.media_file,
+                item.media_url,
                 "NEW",
             ),
         )
@@ -702,6 +761,70 @@ def receive_telegram_trade(
         "telegram_message_id": item.telegram_message_id,
         "source": item.source_group,
     }
+
+
+# ============================================================
+# TRADE MEDIA UPLOAD AND RETRIEVAL
+# ============================================================
+
+@app.post("/trades/media")
+async def upload_trade_media(
+    request: Request,
+    file: UploadFile = File(...),
+    telegram_chat_id: str = Form(...),
+    telegram_message_id: str = Form(...),
+) -> dict[str, str]:
+    content_type = (file.content_type or "").lower()
+    if content_type not in ALLOWED_MEDIA_TYPES:
+        await file.close()
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported media type. Use JPEG, PNG, or WebP.",
+        )
+
+    original_extension = Path(file.filename or "").suffix.lower()
+    if original_extension not in ALLOWED_MEDIA_TYPES[content_type]:
+        original_extension = MEDIA_TYPE_EXTENSIONS[content_type]
+
+    safe_chat_id = sanitize_media_identifier(telegram_chat_id)
+    safe_message_id = sanitize_media_identifier(telegram_message_id)
+    filename = f"trade_{safe_chat_id}_{safe_message_id}{original_extension}"
+    destination = MEDIA_DIRECTORY / filename
+
+    if destination.exists():
+        filename = (
+            f"trade_{safe_chat_id}_{safe_message_id}_"
+            f"{uuid4().hex[:8]}{original_extension}"
+        )
+        destination = MEDIA_DIRECTORY / filename
+
+    contents = await file.read()
+    await file.close()
+    if not contents:
+        raise HTTPException(status_code=400, detail="Uploaded media is empty")
+
+    MEDIA_DIRECTORY.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(contents)
+
+    media_url = (
+        f"{str(request.base_url).rstrip('/')}/trades/media/{quote(filename, safe='')}"
+    )
+    return {
+        "status": "saved",
+        "filename": filename,
+        "media_url": media_url,
+    }
+
+
+@app.get("/trades/media/{filename}")
+def get_trade_media(filename: str) -> FileResponse:
+    media_path = resolve_media_path(filename)
+    media_type = mimetypes.guess_type(media_path.name)[0]
+    return FileResponse(
+        media_path,
+        media_type=media_type or "application/octet-stream",
+        filename=media_path.name,
+    )
 
 
 # ============================================================
