@@ -448,6 +448,7 @@ def api_info() -> dict[str, Any]:
             "POST /scholarships/telegram",
             "POST /scholarships/media",
             "GET /scholarships/media/{filename}",
+            "GET /scholarships/{item_id}/media",
             "GET /scholarships/{item_id}/image",
             "GET /scholarships/recent",
             "GET /scholarships/unreviewed",
@@ -456,6 +457,7 @@ def api_info() -> dict[str, Any]:
             "POST /trades/telegram",
             "POST /trades/media",
             "GET /trades/media/{filename}",
+            "GET /trades/{item_id}/media",
             "GET /trades/{item_id}/image",
             "GET /trades/recent",
             "GET /trades/{item_id}",
@@ -758,6 +760,47 @@ def scholarship_media_is_image(media_type: str | None) -> bool:
         or normalized == "image"
         or normalized.startswith("image/")
     )
+
+
+
+@app.get("/scholarships/{item_id}/media")
+def scholarship_media_info(item_id: int) -> dict[str, Any]:
+    with get_connection() as connection:
+        row = connection.execute(
+            """
+            SELECT
+                id,
+                title,
+                has_media,
+                media_type,
+                media_file,
+                media_url
+            FROM scholarships
+            WHERE id = ?
+            """,
+            (item_id,),
+        ).fetchone()
+
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Scholarship not found",
+        )
+
+    if not bool(row["has_media"]):
+        raise HTTPException(
+            status_code=404,
+            detail="Scholarship has no media",
+        )
+
+    return {
+        "id": row["id"],
+        "title": row["title"],
+        "has_media": bool(row["has_media"]),
+        "media_type": row["media_type"],
+        "media_file": row["media_file"],
+        "media_url": row["media_url"],
+    }
 
 
 @app.get("/scholarships/{item_id}/image", response_model=None)
@@ -1094,6 +1137,49 @@ def is_image_media_type(media_type: str | None) -> bool:
     return normalized == "photo" or normalized == "image" or normalized.startswith(
         "image/"
     )
+
+
+
+@app.get("/trades/{item_id}/media")
+def trade_media_info(item_id: int) -> dict[str, Any]:
+    with get_connection() as connection:
+        row = connection.execute(
+            """
+            SELECT
+                id,
+                source_group,
+                telegram_message_id,
+                has_media,
+                media_type,
+                media_file,
+                media_url
+            FROM trades
+            WHERE id = ?
+            """,
+            (item_id,),
+        ).fetchone()
+
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Trade record not found",
+        )
+
+    if not bool(row["has_media"]):
+        raise HTTPException(
+            status_code=404,
+            detail="Trade has no media",
+        )
+
+    return {
+        "id": row["id"],
+        "source_group": row["source_group"],
+        "telegram_message_id": row["telegram_message_id"],
+        "has_media": bool(row["has_media"]),
+        "media_type": row["media_type"],
+        "media_file": row["media_file"],
+        "media_url": row["media_url"],
+    }
 
 
 @app.get("/trades/{item_id}/image")
