@@ -1,4 +1,6 @@
 from contextlib import asynccontextmanager
+import base64
+import json
 from datetime import date, datetime, timedelta, timezone
 import mimetypes
 import os
@@ -8,6 +10,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 import psycopg
+from openai import OpenAI
 from psycopg.rows import dict_row
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile, status
 from fastapi.responses import JSONResponse, Response
@@ -19,6 +22,8 @@ from pydantic import BaseModel, ConfigDict
 # ============================================================
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_VISION_MODEL = os.getenv("OPENAI_VISION_MODEL", "gpt-5").strip()
 
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL environment variable is required")
@@ -338,6 +343,7 @@ def api_info() -> dict[str, Any]:
             "GET /trades/media/{filename}",
             "GET /trades/{item_id}/media",
             "GET /trades/{item_id}/image",
+            "POST /trades/{item_id}/vision",
             "GET /trades/recent",
             "GET /trades/{item_id}",
         ],
@@ -802,6 +808,187 @@ def get_trade_image(item_id: int):
         )
 
     return Response(content=bytes(asset["media_bytes"]), media_type=asset["content_type"])
+
+
+
+@app.post("/trades/{item_id}/vision")
+def analyze_trade_vision(item_id: int) -> dict[str, Any]:
+    """
+    Analyze the actual stored Telegram trade chart with an OpenAI vision-capable model.
+
+    The image is loaded from PostgreSQL and sent as a base64 data URL, so the
+    analysis does not depend on the public media URL being fetchable by ChatGPT.
+    """
+
+    if not OPENAI_API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="OPENAI_API_KEY environment variable is not configured",
+        )
+
+    # Load the trade record.
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"""
+                SELECT
+                    id,
+                    source_group,
+                    telegram_message_id,
+                    original_text,
+                    has_media,
+                    media_type,
+                    media_url
+                FROM {TRADE_TABLE}
+                WHERE id = %s
+                """,
+                (item_id,),
+            )
+            trade = cursor.fetchone()
+
+    if trade is None:
+        raise HTTPException(status_code=404, detail="Trade record not found")
+
+    if not trade["has_media"]:
+        raise HTTPException(status_code=404, detail="Trade has no media")
+
+    if not trade_media_is_image(trade["media_type"]):
+        raise HTTPException(status_code=400, detail="Trade media is not an image")
+
+    filename = filename_from_media_url(trade["media_url"])
+    if not filename:
+        raise HTTPException(status_code=404, detail="Trade image filename not found")
+
+    asset = get_media_asset(filename, "trade")
+    if asset is None:
+        raise HTTPException(status_code=404, detail="Trade image file not found")
+
+    image_bytes = bytes(asset["media_bytes"])
+    content_type = asset["content_type"]
+    image_b64 = base64.b64encode(image_bytes).decode("ascii")
+    image_data_url = f"data:{content_type};base64,{image_b64}"
+
+    prompt = f"""
+You are analyzing a Telegram trading chart screenshot.
+
+DATABASE RECORD ID: {item_id}
+SOURCE GROUP: {trade["source_group"]}
+TELEGRAM MESSAGE ID: {trade["telegram_message_id"]}
+TELEGRAM TEXT:
+{trade["original_text"] or "(no text/caption)"}
+
+Inspect ONLY what is actually visible in the chart image.
+
+Extract:
+- instrument/symbol
+- timeframe
+- trade direction or bias
+- visible/planned entry
+- visible stop loss
+- visible take profit
+- whether BOS is visibly marked or clearly evidenced
+- whether CHoCH/MSS is visibly marked or clearly evidenced
+- whether a liquidity sweep is visibly marked or clearly evidenced
+- whether inducement is visibly marked or clearly evidenced
+- visible POI/order block/supply/demand/entry zone
+- a confidence score from 0 to 1
+
+Rules:
+- Never invent missing values.
+- Use null when a value cannot be confirmed.
+- A boolean must be null if it cannot be confirmed from the image.
+- Do not infer an exact price unless it is visibly readable.
+- Keep POI concise and factual.
+"""
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "id": {"type": "integer"},
+            "instrument": {"type": ["string", "null"]},
+            "timeframe": {"type": ["string", "null"]},
+            "direction": {
+                "type": ["string", "null"],
+                "enum": ["BUY", "SELL", "BULLISH", "BEARISH", None],
+            },
+            "entry": {"type": ["string", "null"]},
+            "stop_loss": {"type": ["string", "null"]},
+            "take_profit": {"type": ["string", "null"]},
+            "bos": {"type": ["boolean", "null"]},
+            "choch_mss": {"type": ["boolean", "null"]},
+            "liquidity_sweep": {"type": ["boolean", "null"]},
+            "inducement": {"type": ["boolean", "null"]},
+            "poi": {"type": ["string", "null"]},
+            "confidence": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1,
+            },
+        },
+        "required": [
+            "id",
+            "instrument",
+            "timeframe",
+            "direction",
+            "entry",
+            "stop_loss",
+            "take_profit",
+            "bos",
+            "choch_mss",
+            "liquidity_sweep",
+            "inducement",
+            "poi",
+            "confidence",
+        ],
+        "additionalProperties": False,
+    }
+
+    try:
+        client = OpenAI(api_key=OPENAI_API_KEY)
+
+        response = client.responses.create(
+            model=OPENAI_VISION_MODEL,
+            input=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": prompt,
+                        },
+                        {
+                            "type": "input_image",
+                            "image_url": image_data_url,
+                            "detail": "high",
+                        },
+                    ],
+                }
+            ],
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": "trade_vision_analysis",
+                    "schema": schema,
+                    "strict": True,
+                }
+            },
+        )
+
+        if not response.output_text:
+            raise RuntimeError("Vision model returned no text output")
+
+        result = json.loads(response.output_text)
+        result["id"] = item_id
+        return result
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        # Do not expose API keys or full upstream payloads in the public response.
+        raise HTTPException(
+            status_code=502,
+            detail=f"Vision analysis failed: {type(exc).__name__}: {str(exc)[:300]}",
+        )
 
 
 @app.get("/trades/recent", response_model=list[Trade])
