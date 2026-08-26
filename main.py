@@ -8,7 +8,7 @@ from typing import Any
 from uuid import uuid4
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile, status
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict
 from urllib.parse import quote
 
@@ -19,6 +19,7 @@ from urllib.parse import quote
 
 DATABASE_PATH = Path(__file__).with_name("scholarships.db")
 MEDIA_DIRECTORY = Path(__file__).with_name("trade_media")
+SCHOLARSHIP_MEDIA_DIRECTORY = Path(__file__).with_name("scholarship_media")
 
 ALLOWED_MEDIA_TYPES = {
     "image/jpeg": {".jpg", ".jpeg"},
@@ -57,6 +58,10 @@ class Scholarship(BaseModel):
     source_url: str | None = None
     posted_at: datetime
     is_reviewed: bool
+    has_media: bool = False
+    media_type: str | None = None
+    media_file: str | None = None
+    media_url: str | None = None
 
 
 class ScholarshipCreate(BaseModel):
@@ -87,6 +92,8 @@ class TelegramScholarshipIn(BaseModel):
     telegram_message_link: str | None = None
     has_media: bool = False
     media_type: str | None = None
+    media_file: str | None = None
+    media_url: str | None = None
 
 
 # ============================================================
@@ -134,6 +141,7 @@ class TelegramTradeIn(BaseModel):
 
 def initialize_database() -> None:
     MEDIA_DIRECTORY.mkdir(parents=True, exist_ok=True)
+    SCHOLARSHIP_MEDIA_DIRECTORY.mkdir(parents=True, exist_ok=True)
 
     with get_connection() as connection:
 
@@ -155,10 +163,35 @@ def initialize_database() -> None:
                 source_message_id TEXT,
                 source_url TEXT,
                 posted_at TEXT NOT NULL,
-                is_reviewed INTEGER NOT NULL DEFAULT 0
+                is_reviewed INTEGER NOT NULL DEFAULT 0,
+                has_media INTEGER NOT NULL DEFAULT 0,
+                media_type TEXT,
+                media_file TEXT,
+                media_url TEXT
             )
             """
         )
+
+        scholarship_columns = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(scholarships)"
+            ).fetchall()
+        }
+
+        scholarship_migrations = {
+            "has_media": "INTEGER NOT NULL DEFAULT 0",
+            "media_type": "TEXT",
+            "media_file": "TEXT",
+            "media_url": "TEXT",
+        }
+
+        for column_name, column_definition in scholarship_migrations.items():
+            if column_name not in scholarship_columns:
+                connection.execute(
+                    f"ALTER TABLE scholarships ADD COLUMN "
+                    f"{column_name} {column_definition}"
+                )
 
         # ----------------------------------------------------
         # TRADES TABLE
@@ -276,6 +309,7 @@ def initialize_database() -> None:
 def row_to_scholarship(row: sqlite3.Row) -> Scholarship:
     values: dict[str, Any] = dict(row)
     values["is_reviewed"] = bool(values["is_reviewed"])
+    values["has_media"] = bool(values.get("has_media", 0))
     return Scholarship(**values)
 
 
@@ -307,6 +341,33 @@ def resolve_media_path(filename: str) -> Path:
 
     if not candidate.is_file():
         raise HTTPException(status_code=404, detail="Media file not found")
+
+    return candidate
+
+
+def resolve_scholarship_media_path(filename: str) -> Path:
+    media_root = SCHOLARSHIP_MEDIA_DIRECTORY.resolve()
+    candidate = (media_root / filename).resolve()
+
+    if Path(filename).name != filename:
+        raise HTTPException(
+            status_code=404,
+            detail="Scholarship media file not found",
+        )
+
+    try:
+        candidate.relative_to(media_root)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail="Scholarship media file not found",
+        ) from exc
+
+    if not candidate.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail="Scholarship media file not found",
+        )
 
     return candidate
 
@@ -385,6 +446,9 @@ def api_info() -> dict[str, Any]:
         "endpoints": [
             "POST /scholarships",
             "POST /scholarships/telegram",
+            "POST /scholarships/media",
+            "GET /scholarships/media/{filename}",
+            "GET /scholarships/{item_id}/image",
             "GET /scholarships/recent",
             "GET /scholarships/unreviewed",
             "GET /scholarships/today",
@@ -556,9 +620,13 @@ def receive_telegram_scholarship(
                 source_message_id,
                 source_url,
                 posted_at,
-                is_reviewed
+                is_reviewed,
+                has_media,
+                media_type,
+                media_file,
+                media_url
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 title,
@@ -572,6 +640,10 @@ def receive_telegram_scholarship(
                 item.telegram_message_link,
                 posted_at,
                 0,
+                int(item.has_media),
+                item.media_type,
+                item.media_file,
+                item.media_url,
             ),
         )
 
@@ -584,6 +656,183 @@ def receive_telegram_scholarship(
         "telegram_message_id": item.telegram_message_id,
         "source": item.source_group,
     }
+
+
+# ============================================================
+# SCHOLARSHIP MEDIA UPLOAD AND RETRIEVAL
+# ============================================================
+
+@app.post("/scholarships/media")
+async def upload_scholarship_media(
+    request: Request,
+    file: UploadFile = File(...),
+    telegram_chat_id: str = Form(...),
+    telegram_message_id: str = Form(...),
+) -> dict[str, str]:
+    content_type = (file.content_type or "").lower()
+
+    if content_type not in ALLOWED_MEDIA_TYPES:
+        await file.close()
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported media type. Use JPEG, PNG, or WebP.",
+        )
+
+    original_extension = Path(file.filename or "").suffix.lower()
+    if original_extension not in ALLOWED_MEDIA_TYPES[content_type]:
+        original_extension = MEDIA_TYPE_EXTENSIONS[content_type]
+
+    safe_chat_id = sanitize_media_identifier(telegram_chat_id)
+    safe_message_id = sanitize_media_identifier(telegram_message_id)
+
+    filename = (
+        f"scholarship_{safe_chat_id}_{safe_message_id}"
+        f"{original_extension}"
+    )
+    destination = SCHOLARSHIP_MEDIA_DIRECTORY / filename
+
+    if destination.exists():
+        filename = (
+            f"scholarship_{safe_chat_id}_{safe_message_id}_"
+            f"{uuid4().hex[:8]}{original_extension}"
+        )
+        destination = SCHOLARSHIP_MEDIA_DIRECTORY / filename
+
+    contents = await file.read()
+    await file.close()
+
+    if not contents:
+        raise HTTPException(
+            status_code=400,
+            detail="Uploaded media is empty",
+        )
+
+    SCHOLARSHIP_MEDIA_DIRECTORY.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(contents)
+
+    media_url = (
+        f"{str(request.base_url).rstrip('/')}"
+        f"/scholarships/media/{quote(filename, safe='')}"
+    )
+
+    return {
+        "status": "saved",
+        "filename": filename,
+        "media_url": media_url,
+    }
+
+
+@app.get("/scholarships/media/{filename}")
+def get_scholarship_media(filename: str) -> FileResponse:
+    media_path = resolve_scholarship_media_path(filename)
+    media_type = mimetypes.guess_type(media_path.name)[0]
+
+    return FileResponse(
+        media_path,
+        media_type=media_type or "application/octet-stream",
+        filename=media_path.name,
+    )
+
+
+def scholarship_media_filename(row: sqlite3.Row) -> str | None:
+    media_url = row["media_url"] if "media_url" in row.keys() else None
+
+    if media_url:
+        url_path = str(media_url).split("?", 1)[0].rstrip("/")
+        filename = url_path.rsplit("/", 1)[-1]
+        if filename:
+            return filename
+
+    media_file = row["media_file"] if "media_file" in row.keys() else None
+
+    if media_file:
+        return Path(str(media_file)).name
+
+    return None
+
+
+def scholarship_media_is_image(media_type: str | None) -> bool:
+    normalized = (media_type or "").lower().strip()
+    return (
+        normalized == "photo"
+        or normalized == "image"
+        or normalized.startswith("image/")
+    )
+
+
+@app.get("/scholarships/{item_id}/image", response_model=None)
+def get_scholarship_image(
+    item_id: int,
+):
+    with get_connection() as connection:
+        row = connection.execute(
+            """
+            SELECT *
+            FROM scholarships
+            WHERE id = ?
+            """,
+            (item_id,),
+        ).fetchone()
+
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Scholarship not found",
+        )
+
+    if not bool(row["has_media"]):
+        raise HTTPException(
+            status_code=404,
+            detail="Scholarship has no media",
+        )
+
+    if not scholarship_media_is_image(row["media_type"]):
+        raise HTTPException(
+            status_code=400,
+            detail="Scholarship media is not an image",
+        )
+
+    filename = scholarship_media_filename(row)
+
+    if filename is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Scholarship image file not found",
+        )
+
+    try:
+        media_path = resolve_scholarship_media_path(filename)
+    except HTTPException:
+        media_path = None
+
+    if media_path is None:
+        if row["media_url"]:
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "detail": "Scholarship image file not found",
+                    "media_url": row["media_url"],
+                },
+            )
+
+        raise HTTPException(
+            status_code=404,
+            detail="Scholarship image file not found",
+        )
+
+    media_type = mimetypes.guess_type(media_path.name)[0]
+
+    if media_type not in ALLOWED_MEDIA_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail="Scholarship media is not an image",
+        )
+
+    return FileResponse(
+        media_path,
+        media_type=media_type,
+        filename=media_path.name,
+    )
 
 
 # ============================================================
