@@ -1,0 +1,688 @@
+# V2 Backtesting & Replay Architecture
+
+## 1. Purpose
+
+The Backtesting & Replay Engine evaluates strategy rules on historical market data while preserving realistic chronological information flow.
+
+The engine must simulate what would have been known at each historical timestamp.
+
+It must never use future candles, future outcomes, later structure, later news, or historical trades created after the replay timestamp.
+
+---
+
+## 2. Core Principle
+
+Historical analysis must be performed candle-by-candle.
+
+At replay time T:
+
+AVAILABLE:
+- candles at or before T
+- news known at or before T
+- PDF rules already verified
+- historical trades completed before T
+- currency-strength data available at or before T
+
+FORBIDDEN:
+- candles after T
+- final future swing highs/lows
+- later MSS/BOS
+- future news outcomes
+- future trade results
+- future historical similarity records
+
+This is mandatory look-ahead protection.
+
+---
+
+## 3. Replay Modes
+
+Support:
+
+### BAR-BY-BAR REPLAY
+Advance one completed candle at a time.
+
+### MULTI-TIMEFRAME REPLAY
+Reconstruct W, D, H4, H1, M30, M15, M5, M1 context at each timestamp.
+
+### SETUP REPLAY
+Start before a known historical setup and observe whether the system identifies it naturally.
+
+### TRADE REPLAY
+Reconstruct a stored WIN, LOSS, BREAKEVEN, or AVOIDED trade from pre-entry conditions.
+
+### BLIND BACKTEST
+Scan historical data without supplying the known future outcome.
+
+---
+
+## 4. Replay Inputs
+
+Each replay request should include where applicable:
+
+- replay_id
+- instrument
+- asset_class
+- methodology
+- date_from
+- date_to
+- starting timestamp
+- ending timestamp
+- execution timeframe
+- higher timeframes
+- candle count
+- strategy/rule filters
+- session filters
+- news filter
+- risk settings
+- initial account balance if portfolio simulation is required
+
+Never default to EUR_USD.
+
+Use the exact requested supported instrument.
+
+---
+
+## 5. Market Data
+
+Historical candles must come from a validated source such as OANDA or another approved feed.
+
+Store:
+
+- instrument
+- timeframe
+- timestamp
+- open
+- high
+- low
+- close
+- volume where available
+- candle completion state
+
+Only completed candles should normally drive confirmed structural decisions.
+
+---
+
+## 6. Multi-Timeframe Synchronization
+
+All timeframes must be synchronized to the replay timestamp.
+
+Example:
+
+Replay time:
+10:35
+
+M5:
+10:35 candle may still be forming depending on data convention.
+
+H1:
+only the last completed H1 candle may be used for confirmed H1 structure.
+
+D:
+only the latest completed Daily candle may be treated as confirmed.
+
+Never allow lower-timeframe replay to access a higher-timeframe candle that had not closed yet.
+
+---
+
+## 7. Market-State Snapshot
+
+At every replay step generate a historical market snapshot containing:
+
+- exact timestamp
+- current price
+- HTF structure
+- intermediate structure
+- execution structure
+- liquidity state
+- dealing range
+- premium/discount
+- POIs
+- displacement
+- MSS/BOS state
+- relevant PDF rules
+- news risk
+- currency strength
+- available historical similarity evidence
+
+This snapshot represents only information known at that moment.
+
+---
+
+## 8. Rule Retrieval During Replay
+
+Use the Version 2 Rule Retrieval Engine.
+
+Retrieve only verified rules relevant to:
+
+- methodology
+- current market structure
+- liquidity
+- POI
+- direction
+- timeframe
+- session
+
+Rule retrieval itself may use the current historical market state but never future outcome information.
+
+---
+
+## 9. Setup Feature Extraction
+
+At each candidate setup, generate a record conforming to:
+
+`v2_setup_feature_schema.json`
+
+Set:
+
+`source_type = replay`
+
+The record must contain only evidence available at that timestamp.
+
+Outcome must initially remain:
+
+`OPEN`
+
+until future candles are replayed.
+
+---
+
+## 10. Candidate Setup Detection
+
+The engine may identify a candidate when conditions such as these appear:
+
+- relevant liquidity event
+- valid POI interaction
+- displacement
+- meaningful MSS/BOS
+- retracement
+- entry trigger
+
+Candidate detection must follow retrieved PDF methodology.
+
+Do not scan for setups using final historical outcome.
+
+---
+
+## 11. Confirmation Timing
+
+A setup becomes confirmed only when all required conditions were visible historically.
+
+Example:
+
+Liquidity sweep at 10:05
+Displacement at 10:10
+MSS confirmed at 10:15
+FVG retracement at 10:25
+
+The setup must not be marked confirmed at 10:05.
+
+Store the actual confirmation timestamp.
+
+---
+
+## 12. Entry Simulation
+
+Entry types may include:
+
+- market after confirmation
+- limit/retracement entry
+- PDF-defined execution model
+
+Record:
+
+- signal timestamp
+- entry timestamp
+- entry price
+- entry zone
+- confirmation timeframe
+- spread/slippage where modeled
+- reason for entry
+
+Do not assume perfect fills.
+
+---
+
+## 13. No False Precision
+
+Historical OHLC candles do not always reveal exact intrabar sequence.
+
+If both stop and target occur inside the same candle and lower-timeframe data is unavailable:
+
+mark outcome as:
+
+`AMBIGUOUS_INTRABAR`
+
+Do not choose the favorable outcome automatically.
+
+Use lower-timeframe data where available to resolve sequence.
+
+---
+
+## 14. Stop Placement
+
+Stops must follow:
+
+- PDF methodology
+- structural invalidation
+- user risk rules
+
+Store:
+
+- stop price
+- invalidation level
+- stop distance
+- risk %
+- stop logic
+
+Never move a historical stop after seeing future price action unless the strategy explicitly permits management based on information available at that time.
+
+---
+
+## 15. Target Simulation
+
+Track:
+
+- TP1
+- TP2
+- TP3
+- opposing liquidity
+- HTF objective
+- partial exits
+- runner logic
+
+Record whether each target was touched and at what timestamp.
+
+Targets must be defined before their outcome is known.
+
+---
+
+## 16. Trade Management
+
+Management actions may include:
+
+- partial close
+- move to breakeven
+- trailing stop
+- structural stop adjustment
+- time-based exit
+- session close exit
+
+Every action must be triggered only by information available at that historical moment.
+
+---
+
+## 17. Outcome Classification
+
+Supported outcomes:
+
+- WIN
+- LOSS
+- BREAKEVEN
+- AVOIDED
+- OPEN
+- EXPIRED
+- AMBIGUOUS_INTRABAR
+
+Also classify losses where possible:
+
+- VALID_SETUP_NORMAL_LOSS
+- INVALID_SETUP
+- EARLY_ENTRY
+- LATE_ENTRY
+- NO_CONFIRMATION
+- WEAK_MSS_BOS
+- NEWS_RISK
+- STOP_ERROR
+- MANAGEMENT_ERROR
+- EXECUTION_ERROR
+- other supported classification
+
+---
+
+## 18. MAE and MFE
+
+Calculate:
+
+MAE = Maximum Adverse Excursion
+
+MFE = Maximum Favorable Excursion
+
+Prefer R-normalized values:
+
+- MAE_R
+- MFE_R
+
+These help determine whether:
+
+- stops are consistently too tight
+- exits are premature
+- trades frequently move close to target before reversing
+- management reduces achievable R
+
+---
+
+## 19. R-Multiple Calculation
+
+For each simulated trade calculate where valid:
+
+Initial Risk = |Entry - Stop|
+
+Realized R =
+Realized Profit/Loss / Initial Risk
+
+Track:
+
+- planned R:R
+- realized R
+- maximum potential R
+- MAE_R
+- MFE_R
+
+Do not fabricate R when entry/stop data is incomplete.
+
+---
+
+## 20. News During Replay
+
+Historical news must be evaluated using information available at the replay timestamp.
+
+Record:
+
+- event
+- affected currency/market
+- scheduled time
+- impact
+- known actual/forecast only after release time
+- news risk
+
+Do not use the eventual surprise before the release occurs.
+
+---
+
+## 21. Currency Strength During Replay
+
+Currency-strength calculations must use only historical candles available at that time.
+
+Never calculate strength using future price data.
+
+---
+
+## 22. Historical Similarity During Replay
+
+Similarity scoring may use only historical trades completed BEFORE the replay timestamp.
+
+Example:
+
+Replay date:
+2025-06-01
+
+Trade completed:
+2025-07-10
+
+Forbidden comparison.
+
+This prevents information leakage.
+
+---
+
+## 23. Avoided Setup Simulation
+
+The engine must also record setups rejected because of:
+
+- missing confirmation
+- HTF conflict
+- news risk
+- weak POI
+- poor R:R
+- late entry
+- invalid structure
+- excessive spread
+- session restriction
+
+Store as:
+
+`AVOIDED`
+
+Then replay subsequent price without altering the original decision.
+
+---
+
+## 24. Setup Expiry
+
+A setup may expire if:
+
+- POI invalidated
+- structural thesis invalidated
+- session ends
+- entry never triggers
+- relevant liquidity objective is reached first
+- news conditions invalidate timing
+
+Store the reason.
+
+---
+
+## 25. Backtest Modes
+
+Support future modes:
+
+### SINGLE SETUP
+Test one PDF-defined setup.
+
+### MULTI-SETUP
+Compare multiple entry models.
+
+### FILTER TEST
+Compare setup with/without:
+- news filter
+- currency strength
+- HTF alignment
+- MSS requirement
+- session filter
+
+### PARAMETER TEST
+Test permissible parameters without changing methodology.
+
+Avoid unrestricted optimization that overfits historical data.
+
+---
+
+## 26. Walk-Forward Validation
+
+Later implementation should support:
+
+Training Period
+→ Validation Period
+→ Forward Test Period
+
+Do not optimize and evaluate on the same historical sample without disclosure.
+
+---
+
+## 27. In-Sample vs Out-of-Sample
+
+Clearly label:
+
+IN_SAMPLE
+OUT_OF_SAMPLE
+FORWARD_REPLAY
+
+Performance from in-sample optimization must never be presented as independent validation.
+
+---
+
+## 28. Costs
+
+Where possible model:
+
+- spread
+- commission
+- slippage
+- financing/swap where relevant
+
+Backtest results without costs must be labeled accordingly.
+
+---
+
+## 29. Portfolio Risk
+
+Future portfolio simulation may include:
+
+- simultaneous positions
+- correlated instruments
+- account drawdown
+- daily loss limits
+- weekly loss limits
+- maximum concurrent risk
+
+Do not assume independent trades when positions overlap.
+
+---
+
+## 30. Backtest Statistics
+
+Calculate only from genuine replay results:
+
+- trades
+- wins
+- losses
+- breakevens
+- avoided setups
+- win rate
+- average win R
+- average loss R
+- expectancy
+- profit factor
+- max drawdown
+- average MAE/MFE
+- consecutive wins/losses
+- setup performance
+- instrument performance
+- session performance
+- news-risk performance
+
+---
+
+## 31. Replay Event Log
+
+Every replay should maintain an event log.
+
+Example:
+
+09:00 — H1 context bullish
+09:25 — SSL identified
+09:35 — SSL swept
+09:40 — bullish displacement
+09:45 — meaningful M5 MSS confirmed
+09:50 — bullish FVG created
+10:05 — retracement entry triggered
+10:40 — TP1 reached
+11:15 — TP2 reached
+
+This provides full auditability.
+
+---
+
+## 32. Replay Checkpoints
+
+Store checkpoints at:
+
+- setup detected
+- setup confirmed
+- entry triggered
+- stop modified
+- TP reached
+- invalidation
+- close
+
+This allows later visual replay and dashboard reconstruction.
+
+---
+
+## 33. Backtest Output
+
+Return:
+
+BACKTEST / REPLAY SUMMARY
+
+Replay ID:
+Instrument:
+Methodology:
+Period:
+Timeframes:
+Setup:
+Trades:
+Wins:
+Losses:
+Breakevens:
+Avoided:
+Win Rate:
+Average R:
+Expectancy:
+Profit Factor:
+Max Drawdown:
+Average MAE:
+Average MFE:
+
+WIN PATTERNS:
+LOSS PATTERNS:
+NORMAL LOSSES:
+PREVENTABLE LOSSES:
+RULE COMPLIANCE:
+NEWS EFFECT:
+SESSION EFFECT:
+DATA LIMITATIONS:
+
+---
+
+## 34. Audit Requirements
+
+Each replay must preserve:
+
+- data source
+- candle timestamps
+- rules used
+- setup features
+- entry decision
+- exit decision
+- historical trades available at that time
+- news data available at that time
+- engine version
+
+Results must be reproducible.
+
+---
+
+## 35. Non-Negotiable Rules
+
+The replay engine must never:
+
+- use future candles
+- use future trade outcomes
+- use future historical trades for similarity
+- use unreleased news results
+- retroactively improve entries
+- choose favorable intrabar sequence
+- move stops using hindsight
+- optimize rules solely to improve past profit
+- fabricate fills
+- fabricate spread
+- classify every historical winner as a valid strategy setup
+- hide ambiguous outcomes
+
+---
+
+## 36. Version 2 Objective
+
+The replay engine must eventually answer:
+
+- Would the system have identified this setup in real time?
+- At what exact point was confirmation available?
+- Would the trade actually have triggered?
+- What was the realistic R outcome?
+- How much MAE/MFE occurred?
+- Which PDF rules improved performance?
+- Which conditions repeatedly preceded losses?
+- Does adding news/strength/HTF filters improve historical expectancy?
+- Can the results be reproduced without hindsight?
